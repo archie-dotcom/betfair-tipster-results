@@ -1,0 +1,13 @@
+# Streamlit theming configuration
+#
+# This configuration defines a dark theme inspired by the Betfair interface. It
+# sets a dark background with a warm accent colour for highlights (used in
+# charts and widgets). You can adjust these values to fine‑tune the look and
+# feel of your dashboard.
+
+[theme]
+primaryColor = "#EBA808"            # warm yellow/orange accent
+backgroundColor = "#111111"         # very dark background
+secondaryBackgroundColor = "#202020" # slightly lighter panels
+textColor = "#F5F5F5"               # light grey text
+font = "sans serif"
