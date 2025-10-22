@@ -59,7 +59,11 @@ statistics will be presented in an interactive table.
 """
 
 import pandas as pd
-from typing import Any, Dict
+from typing import Any, Dict, List
+import os
+import glob
+import requests
+import tempfile
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -119,6 +123,12 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if name in col_map:
             # The first match will be used; you can adjust the order if you prefer
             rename_map[col_map[name]] = "profit"
+            break
+
+    # Map date column (MeetingDate in your CSV)
+    for name in ["date", "meetingdate", "meeting_date", "date_time"]:
+        if name in col_map:
+            rename_map[col_map[name]] = "date"
             break
 
     return df.rename(columns=rename_map)
@@ -280,9 +290,18 @@ def main() -> None:
     testing helper functions easier in environments where Streamlit isn't
     available. When executed as a script (via ``streamlit run``) the
     ``streamlit`` package must be installed.
+
+    The page layout and style are tuned to loosely resemble the Betfair app
+    aesthetic shown in the reference images: a dark background with warm
+    accent colours, rounded cards, and coloured tags for back/lay data. A small
+    amount of custom CSS is injected via ``st.markdown`` to apply global
+    styles (colours, spacing, table formatting, card layout). Each section
+    (summary table, top‑five view, tipster detail) is rendered inside a
+    container with a dark background and subtle box shadow.
     """
     try:
         import streamlit as st  # type: ignore
+        import altair as alt  # type: ignore
     except ImportError:
         raise ImportError(
             "Streamlit is not installed. Please install it with `pip install streamlit` "
@@ -290,43 +309,355 @@ def main() -> None:
         )
 
     st.set_page_config(page_title="Betfair Tipster Stats", layout="wide")
+    # Inject custom CSS for dark theme and card/table styling.  These rules
+    # emulate the dark aesthetic of the Betfair app: dark panels, warm
+    # highlights, coloured tags and rounded corners.  The table is
+    # rendered manually with HTML so that we can apply our own classes.
+    st.markdown(
+        """
+        <style>
+        /* Global background and text colours */
+        .stApp {
+            background-color: #111111;
+            color: #F5F5F5;
+        }
+        /* Container around content to add padding */
+        .main .block-container {
+            padding: 1rem 2rem;
+        }
+        /* Generic card styling */
+        .card {
+            background-color: #1b1b1b;
+            border-radius: 10px;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .card h3 {
+            margin-top: 0;
+            margin-bottom: 0.5rem;
+            color: #EBA808;
+        }
+        /* Accent line for cards */
+        .accent-line {
+            height: 3px;
+            background-color: #EBA808;
+            border-radius: 3px;
+            margin-top: -0.5rem;
+            margin-bottom: 0.5rem;
+        }
+        /* Table styling */
+        .bet-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        .bet-table th, .bet-table td {
+            border: 1px solid #333333;
+            padding: 0.5rem;
+        }
+        .bet-table th {
+            background-color: #222222;
+            color: #EBA808;
+            font-weight: bold;
+        }
+        .bet-table tr:nth-child(even) {
+            background-color: #2a2a2a;
+        }
+        .bet-table tr:nth-child(odd) {
+            background-color: #1e1e1e;
+        }
+        /* Metric tags similar to Back/Lay labels */
+        .bet-tag {
+            display: inline-block;
+            padding: 0.25rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-right: 0.5rem;
+            color: #ffffff;
+        }
+        .bet-tag.back {
+            background-color: #224CA8;
+        }
+        .bet-tag.lay {
+            background-color: #E06EB7;
+        }
+        /* Metric container styling */
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 1rem;
+        }
+        .metric-box {
+            background-color: #1b1b1b;
+            border-radius: 8px;
+            padding: 0.8rem;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .metric-title {
+            font-size: 0.8rem;
+            color: #AAAAAA;
+            margin-bottom: 0.25rem;
+        }
+        .metric-value {
+            font-size: 1.4rem;
+            font-weight: bold;
+            color: #F5F5F5;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("Betfair Tipster Statistics")
     st.write(
-        "Upload a CSV file with Betfair tipster data to see summary statistics "
-        "for each contributor. The app calculates metrics such as total bets, "
-        "profit, strike rate, highest winning back price, lowest lay price and "
-        "profit on turnover."
+        "Upload weekly CSV files containing tipster data and view performance metrics."
     )
 
-    uploaded_file = st.file_uploader(
-        "Choose a CSV file", type=["csv"], help="Upload your tipster results CSV"
-    )
+    # Determine where to load CSV data from.  By default the app reads all
+    # CSV files in the local ``data`` directory.  Alternatively, you can
+    # specify one or more Google Drive file IDs via the environment variable
+    # ``BETFAIR_DRIVE_FILE_IDS``.  When set, the app will download each
+    # referenced file from Google Drive before stacking them into a single
+    # DataFrame.  If both ``BETFAIR_DATA_DIR`` and ``BETFAIR_DRIVE_FILE_IDS``
+    # are unset, the app falls back to the ``data`` folder.
+    DATA_DIR = os.environ.get("BETFAIR_DATA_DIR", "data")
+    DRIVE_FILE_IDS: List[str] = []
+    file_ids_env = os.environ.get("BETFAIR_DRIVE_FILE_IDS", "").strip()
+    if file_ids_env:
+        # Accept comma-separated list of file IDs or URLs.  If a full URL is
+        # provided, extract the file ID from it.
+        for token in file_ids_env.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            # If token looks like a full Google Drive URL, attempt to parse the ID
+            if "/d/" in token:
+                try:
+                    # URL pattern: https://drive.google.com/file/d/FILE_ID/view?usp=sharing
+                    parts = token.split("/d/")
+                    file_id = parts[1].split("/")[0]
+                except Exception:
+                    file_id = token
+            else:
+                file_id = token
+            DRIVE_FILE_IDS.append(file_id)
 
-    if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-        except Exception as exc:
-            st.error(f"Failed to read CSV: {exc}")
-            return
+    def download_drive_file(file_id: str) -> str:
+        """Download a Google Drive file to a temporary location.
 
-        try:
-            summary_df = calculate_metrics(df)
-        except ValueError as e:
-            st.error(str(e))
-            return
+        This helper uses the public download endpoint
+        ``https://docs.google.com/uc?export=download`` to fetch the file.  For
+        larger files Google prompts with a confirmation token which must be
+        included in a subsequent request.  The function handles this by
+        checking for a confirmation cookie in the initial response.
 
-        if not summary_df.empty:
-            display_df = summary_df.copy()
-            display_df["Strike Rate"] = display_df["Strike Rate"].apply(
-                lambda x: f"{x:.2%}" if pd.notnull(x) else ""
-            )
-            display_df["Profit on Turnover"] = display_df["Profit on Turnover"].apply(
-                lambda x: f"{x:.2%}" if pd.notnull(x) else ""
-            )
-            st.subheader("Summary by Tipster")
-            st.dataframe(display_df, use_container_width=True)
+        Parameters
+        ----------
+        file_id : str
+            The ID of the Google Drive file to download.
+
+        Returns
+        -------
+        str
+            Path to the downloaded file on the local filesystem.
+        """
+        URL = "https://docs.google.com/uc?export=download"
+        session = requests.Session()
+        response = session.get(URL, params={"id": file_id}, stream=True)
+        # Check for confirmation token (used when file is large or not yet confirmed)
+        token = None
+        for k, v in response.cookies.items():
+            if k.startswith("download_warning"):
+                token = v
+                break
+        if token:
+            response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True)
+        # Save content to a temporary file
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+        with os.fdopen(tmp_fd, "wb") as tmp_file:
+            for chunk in response.iter_content(chunk_size=32768):
+                if chunk:
+                    tmp_file.write(chunk)
+        return tmp_path
+
+    def load_data() -> pd.DataFrame:
+        data_frames: List[pd.DataFrame] = []
+        # If file IDs provided, download each from Google Drive
+        if DRIVE_FILE_IDS:
+            for fid in DRIVE_FILE_IDS:
+                try:
+                    file_path = download_drive_file(fid)
+                    df_part = pd.read_csv(file_path)
+                    df_part["_source"] = f"drive:{fid}"
+                    data_frames.append(df_part)
+                except Exception as exc:
+                    st.warning(f"Failed to download or read Google Drive file {fid}: {exc}")
+        # Also load any local CSVs from the directory
+        pattern = os.path.join(DATA_DIR, "*.csv")
+        for file_path in sorted(glob.glob(pattern)):
+            try:
+                df_part = pd.read_csv(file_path)
+                df_part["_source"] = os.path.basename(file_path)
+                data_frames.append(df_part)
+            except Exception as exc:
+                st.warning(f"Failed to read {file_path}: {exc}")
+        if data_frames:
+            df_all = pd.concat(data_frames, ignore_index=True)
+            return df_all
         else:
-            st.info("No data available to display.")
+            return pd.DataFrame()
+
+    df_raw = load_data()
+    if df_raw.empty:
+        st.info(
+            "No data found. Please upload your weekly CSVs into the 'data' folder, "
+            "set the BETFAIR_DATA_DIR environment variable to a folder containing CSVs, "
+            "or provide Google Drive file IDs via the BETFAIR_DRIVE_FILE_IDS environment variable."
+        )
+        return
+
+    # Compute summary metrics
+    try:
+        summary_df = calculate_metrics(df_raw)
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    # Format the summary for display
+    display_df = summary_df.copy()
+    display_df["Strike Rate"] = display_df["Strike Rate"].apply(
+        lambda x: f"{x:.2%}" if pd.notnull(x) else ""
+    )
+    display_df["Profit on Turnover"] = display_df["Profit on Turnover"].apply(
+        lambda x: f"{x:.2%}" if pd.notnull(x) else ""
+    )
+
+    # User interface: Tabs for different views.  We wrap each tab’s content
+    # in a card div to provide padding and a dark background.
+    tab1, tab2, tab3 = st.tabs(["All Stats", "Top 5", "Tipster View"])
+
+    # 1. All stats: full summary table
+    with tab1:
+        st.markdown(
+            "<div class='card'><h3>Summary by Tipster</h3><div class='accent-line'></div>",
+            unsafe_allow_html=True,
+        )
+        # Convert display_df to HTML so that we can apply our custom table classes
+        html_table = display_df.to_html(classes="bet-table", index=False, escape=False)
+        st.markdown(html_table, unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # 2. Top 5 comparison
+    with tab2:
+        st.markdown(
+            "<div class='card'><h3>Top 5 Tipsters</h3><div class='accent-line'></div>",
+            unsafe_allow_html=True,
+        )
+        metric = st.selectbox(
+            "Select metric for ranking",
+            options=["Total Units Profit", "Strike Rate", "Profit on Turnover"],
+            index=0,
+            key="top_metric",
+        )
+        # Sort by selected metric (numeric sorting). Remove rows with NaN.
+        temp = summary_df.dropna(subset=[metric]).sort_values(by=metric, ascending=False).head(5)
+        # Prepare data for chart. For percentages multiply by 100
+        chart_df = temp[["Tipster", metric]].copy()
+        # Choose colour based on metric type
+        metric_color_map = {
+            "Total Units Profit": "#EBA808",
+            "Strike Rate": "#224CA8",
+            "Profit on Turnover": "#E06EB7",
+        }
+        bar_color = metric_color_map.get(metric, "#EBA808")
+        # Create bar chart using Altair
+        bar = (
+            alt.Chart(chart_df)
+            .mark_bar(color=bar_color)
+            .encode(
+                x=alt.X("Tipster:N", sort=-chart_df[metric].values),
+                y=alt.Y(f"{metric}:Q", title=metric),
+                tooltip=["Tipster", metric],
+            )
+            .properties(height=350)
+        )
+        st.altair_chart(bar, use_container_width=True)
+        # Display table below the chart with formatted percentages if applicable
+        temp_disp = temp.copy()
+        if metric == "Strike Rate":
+            temp_disp[metric] = (temp_disp[metric] * 100).round(2).astype(str) + "%"
+        elif metric == "Profit on Turnover":
+            temp_disp[metric] = (temp_disp[metric] * 100).round(2).astype(str) + "%"
+        # Render mini-table
+        html_table2 = temp_disp[["Tipster", metric]].to_html(classes="bet-table", index=False, escape=False)
+        st.markdown(html_table2, unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # 3. Tipster-specific view
+    with tab3:
+        st.markdown(
+            "<div class='card'><h3>Tipster Detail</h3><div class='accent-line'></div>",
+            unsafe_allow_html=True,
+        )
+        tipster_names = summary_df["Tipster"].tolist()
+        selected_tipster = st.selectbox("Select a tipster", options=tipster_names, key="tipster_select")
+        # Filter original data for the selected tipster
+        tip_df = df_raw.copy()
+        tip_df = normalize_columns(tip_df)
+        tip_df = tip_df[tip_df["tipster"] == selected_tipster]
+        # Compute metrics for this tipster
+        try:
+            tip_summary = calculate_metrics(tip_df)
+        except ValueError:
+            tip_summary = pd.DataFrame()
+        # Display metrics in custom metric boxes
+        if not tip_summary.empty:
+            row = tip_summary.iloc[0]
+            # Build HTML for metrics grid
+            metrics_html = "<div class='metric-grid'>"
+            metrics = [
+                ("Total Bets", f"{int(row['Total Bets'])}"),
+                ("Units Profit", f"{row['Total Units Profit']:.2f}"),
+                ("Strike Rate", f"{row['Strike Rate']:.2%}"),
+                ("POT", f"{row['Profit on Turnover']:.2%}"),
+                ("Highest Win Back", f"{row['Highest Winning Back Price']:.2f}" if pd.notnull(row['Highest Winning Back Price']) else "N/A"),
+                ("Lowest Lay", f"{row['Lowest Lay Price']:.2f}" if pd.notnull(row['Lowest Lay Price']) else "N/A"),
+            ]
+            for title, value in metrics:
+                metrics_html += f"<div class='metric-box'><div class='metric-title'>{title}</div><div class='metric-value'>{value}</div></div>"
+            metrics_html += "</div>"
+            st.markdown(metrics_html, unsafe_allow_html=True)
+        # Line graph of cumulative units over time
+        # Prepare data with date and profit
+        if "date" not in tip_df.columns:
+            # Try to parse MeetingDate if present
+            if "MeetingDate" in tip_df.columns:
+                tip_df["date"] = pd.to_datetime(tip_df["MeetingDate"], dayfirst=True, errors="coerce")
+        # Ensure date column exists and is datetime
+        if "date" in tip_df.columns:
+            tip_df["date"] = pd.to_datetime(tip_df["date"], errors="coerce")
+            tip_df = tip_df.dropna(subset=["date"])
+            tip_df = tip_df.sort_values("date")
+            # Compute cumulative units profit
+            tip_df["profit"] = tip_df.apply(compute_profit, axis=1)
+            tip_df["cumulative_profit"] = tip_df["profit"].cumsum()
+            line = (
+                alt.Chart(tip_df)
+                .mark_line(color="#EBA808")
+                .encode(
+                    x=alt.X("date:T", title="Date"),
+                    y=alt.Y("cumulative_profit:Q", title="Cumulative Units Profit"),
+                    tooltip=["date:T", "cumulative_profit:Q"],
+                )
+                .properties(height=350)
+            )
+            st.altair_chart(line, use_container_width=True)
+        else:
+            st.info("No date information available to plot cumulative profit.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
